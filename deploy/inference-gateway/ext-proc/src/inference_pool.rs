@@ -17,11 +17,10 @@
 //! flat `spec.selector` map, so they never reach this watch or parser.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use anyhow::Result;
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
-use kube::runtime::watcher;
+use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Api, Client};
 use tokio::sync::watch;
 
@@ -72,14 +71,13 @@ pub async fn spawn_pool_watch(
         // Crucially, deletions that happen while the watch is disconnected are
         // reported via `None` on the next relist (not a `Delete` event), so
         // stale `PoolState` can never survive a reconnect.
-        let stream = watcher::watch_object(api, &name);
+        let stream = watcher::watch_object(api, &name).default_backoff();
         tokio::pin!(stream);
         loop {
             match stream.next().await {
                 Some(Ok(obj)) => publish_pool_state(obj, &name, &tx),
                 Some(Err(e)) => {
                     tracing::warn!(error = %e, pool = %name, "InferencePool watch error; retrying");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
                 None => {
                     tracing::warn!(pool = %name, "InferencePool watch stream ended");

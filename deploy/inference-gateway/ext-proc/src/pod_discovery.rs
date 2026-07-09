@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pod discovery for standalone (raw-vLLM) mode, driven by the `InferencePool`.
+//! Pod discovery for standalone (raw inference-engine) mode, driven by the `InferencePool`.
 //!
 //! The pod label selector and HTTP target port come from the GAIE
 //! [`InferencePool`](crate::inference_pool) this EPP backs — the same object the
@@ -30,7 +30,7 @@ use tokio::sync::watch;
 use crate::epp_standalone_config::EppStandaloneConfig;
 use crate::inference_pool::{PoolState, spawn_pool_watch};
 
-/// A discovered, `Ready` raw vLLM worker normalized for selector registration.
+/// A discovered, `Ready` raw inference engine worker normalized for selector registration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawWorker {
     /// Stable hash of the pod name; the selector catalog key.
@@ -41,7 +41,7 @@ pub struct RawWorker {
     pub pod_ip: String,
     /// OpenAI HTTP inference endpoint, `http://<ip>:<target_port>`.
     pub http_endpoint: String,
-    /// vLLM KV-event ZMQ PUB endpoint, `tcp://<ip>:<kv_event_port>`.
+    /// Inference engine KV-event ZMQ PUB endpoint, `tcp://<ip>:<kv_event_port>`.
     pub kv_events_endpoint: String,
     /// Optional ZMQ REQ endpoint for live-stream gap replay.
     pub replay_endpoint: Option<String>,
@@ -63,7 +63,7 @@ struct Snapshot {
     endpoints: HashMap<u64, String>,
 }
 
-/// Lock-free view over the `Ready` raw vLLM pods selected by the EPP's
+/// Lock-free view over the `Ready` raw inference engine pods selected by the EPP's
 /// `InferencePool`. Reads never touch the Kubernetes API; they read a cached
 /// [`Snapshot`] that a background task rebuilds on pod/pool changes.
 #[derive(Clone)]
@@ -103,10 +103,10 @@ impl PodDiscovery {
         let kv_event_port = cfg.kv_event_port;
         let replay_port = cfg.replay_port;
 
-        // Cached snapshot of the ready, pool-selected workers. Rebuilt by the two
-        // tasks below (before they bump the change generation), so any consumer
-        // that wakes on a generation bump observes a snapshot that is already
-        // consistent with the store/pool that triggered it.
+        // Cached snapshot of the ready, pool-selected workers. Rebuilt by the task
+        // below (before it bumps the change generation), so any consumer that wakes
+        // on a generation bump observes a snapshot already consistent with the
+        // store/pool that triggered it.
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(build_snapshot(
             &store,
             pool_rx.borrow().as_ref(),
@@ -121,42 +121,50 @@ impl PodDiscovery {
             "Starting namespace pod reflector for standalone mode"
         );
 
-        // Pod reflector stream -> rebuild snapshot, then bump the change generation.
-        let changes_for_pods = changes_tx.clone();
-        let snapshot_for_pods = snapshot_tx.clone();
-        let store_for_pods = store.clone();
-        let pool_for_pods = pool_rx.clone();
+        // A single task owns both wake sources so snapshot builds are serialized:
+        // on either a pod event or a pool change it rebuilds once from the latest
+        // store + latest pool and publishes in order. Two independent producers
+        // could each read state, build, and push to the watch channel in arbitrary
+        // order, letting a stale build overwrite a fresher one (notably during a
+        // pool relist).
+        let store_task = store.clone();
         tokio::spawn(async move {
+            let mut pool_rx = pool_rx;
             tokio::pin!(reflect);
             let mut generation = 0u64;
-            while reflect.next().await.is_some() {
+            loop {
+                tokio::select! {
+                    ev = reflect.next() => match ev {
+                        None => {
+                            tracing::warn!("Inference engine pod reflector stream ended unexpectedly");
+                            break;
+                        }
+                        // During a relist the reflector emits Init + one InitApply
+                        // per pod + InitDone (n+2 events). Rebuilding on each is
+                        // quadratic, so skip the per-object relist events: the store
+                        // is already consistent at InitDone, and Apply/Delete are
+                        // single-object deltas. (Errors don't change the store.)
+                        Some(Ok(watcher::Event::Init | watcher::Event::InitApply(_))) => continue,
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            tracing::warn!(error = %e, "Pod reflector watch error; retrying");
+                            continue;
+                        }
+                    },
+                    changed = pool_rx.changed() => {
+                        if changed.is_err() {
+                            tracing::warn!("InferencePool watch ended");
+                            break;
+                        }
+                    }
+                }
                 let snap = build_snapshot(
-                    &store_for_pods,
-                    pool_for_pods.borrow().as_ref(),
+                    &store_task,
+                    pool_rx.borrow().as_ref(),
                     kv_event_port,
                     replay_port,
                 );
-                let _ = snapshot_for_pods.send(Arc::new(snap));
-                generation = generation.wrapping_add(1);
-                let _ = changes_for_pods.send(generation);
-            }
-            tracing::warn!("Raw-vLLM pod reflector stream ended unexpectedly");
-        });
-
-        // Pool changes also drive reconciliation (membership/target port may move).
-        let mut pool_rx_for_changes = pool_rx.clone();
-        let store_for_pool = store.clone();
-        let snapshot_for_pool = snapshot_tx;
-        tokio::spawn(async move {
-            let mut generation = u64::MAX / 2; // distinct space from pod bumps
-            while pool_rx_for_changes.changed().await.is_ok() {
-                let snap = build_snapshot(
-                    &store_for_pool,
-                    pool_rx_for_changes.borrow().as_ref(),
-                    kv_event_port,
-                    replay_port,
-                );
-                let _ = snapshot_for_pool.send(Arc::new(snap));
+                let _ = snapshot_tx.send(Arc::new(snap));
                 generation = generation.wrapping_add(1);
                 let _ = changes_tx.send(generation);
             }
@@ -226,6 +234,35 @@ impl PodDiscovery {
     }
 }
 
+/// Return `true` iff the pod is `Ready` and not terminating. Mirrors llm-d's
+/// `IsPodReady`: a pod with a deletion timestamp is excluded even if it still
+/// reports `Ready=True`, so draining pods stop receiving traffic promptly.
+fn pod_is_ready(pod: &Pod) -> bool {
+    if pod.metadata.deletion_timestamp.is_some() {
+        return false;
+    }
+    pod.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .map(|conds| {
+            conds
+                .iter()
+                .any(|c| c.type_ == "Ready" && c.status == "True")
+        })
+        .unwrap_or(false)
+}
+
+/// Return `true` iff the pod carries every `match_labels` key with the equal
+/// value (equality-based selector, matching `InferencePool.spec.selector`).
+fn pod_matches(pod: &Pod, match_labels: &BTreeMap<String, String>) -> bool {
+    let Some(labels) = pod.metadata.labels.as_ref() else {
+        return match_labels.is_empty();
+    };
+    match_labels
+        .iter()
+        .all(|(k, v)| labels.get(k).map(|pv| pv == v).unwrap_or(false))
+}
+
 fn strip_scheme(endpoint: &str) -> &str {
     endpoint
         .strip_prefix("http://")
@@ -256,35 +293,6 @@ fn build_snapshot(
         }
     }
     Snapshot { workers, endpoints }
-}
-
-/// Return `true` iff the pod is `Ready` and not terminating. Mirrors llm-d's
-/// `IsPodReady`: a pod with a deletion timestamp is excluded even if it still
-/// reports `Ready=True`, so draining pods stop receiving traffic promptly.
-fn pod_is_ready(pod: &Pod) -> bool {
-    if pod.metadata.deletion_timestamp.is_some() {
-        return false;
-    }
-    pod.status
-        .as_ref()
-        .and_then(|s| s.conditions.as_ref())
-        .map(|conds| {
-            conds
-                .iter()
-                .any(|c| c.type_ == "Ready" && c.status == "True")
-        })
-        .unwrap_or(false)
-}
-
-/// Return `true` iff the pod carries every `match_labels` key with the equal
-/// value (equality-based selector, matching `InferencePool.spec.selector`).
-fn pod_matches(pod: &Pod, match_labels: &BTreeMap<String, String>) -> bool {
-    let Some(labels) = pod.metadata.labels.as_ref() else {
-        return match_labels.is_empty();
-    };
-    match_labels
-        .iter()
-        .all(|(k, v)| labels.get(k).map(|pv| pv == v).unwrap_or(false))
 }
 
 /// Build a [`RawWorker`] from a pod, or `None` if it is not `Ready`, not
