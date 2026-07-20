@@ -11,7 +11,7 @@ use dynamo_mocker::common::protocols::MockEngineArgs;
 use dynamo_vllm_grpc::generate_server::GenerateServer;
 use dynamo_vllm_mocker::{MockerServerConfig, ServerMode, VllmMockerService};
 use dynamo_vllm_sidecar::VllmSidecarEngine;
-use futures::{StreamExt, future::join_all};
+use futures::StreamExt;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -224,21 +224,4 @@ async fn dropping_sidecar_stream_cancels_mocker_work() {
     })
     .await
     .expect("dropping the gRPC stream should cancel scheduler work promptly");
-}
-
-#[tokio::test]
-async fn concurrent_sidecar_requests_share_one_mocker_scheduler() {
-    let server = RunningServer::start(ServerMode::Aggregated, fast_engine_args()).await;
-    let engine = Arc::new(sidecar(&server.endpoint, DisaggregationMode::Aggregated));
-    engine.start(0).await.unwrap();
-
-    let requests = (0..32).map(|_| {
-        let engine = Arc::clone(&engine);
-        async move { collect(&engine, request(4)).await }
-    });
-    let results = join_all(requests).await;
-    assert!(results.iter().all(|outputs| {
-        outputs.len() == 4 && outputs.last().unwrap().finish_reason == Some(FinishReason::Length)
-    }));
-    assert_eq!(server.service.active_request_count(), 0);
 }

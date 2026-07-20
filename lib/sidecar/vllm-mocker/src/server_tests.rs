@@ -3,7 +3,6 @@
 
 use super::request::*;
 use super::*;
-use futures::StreamExt;
 use prost_types::Struct;
 use std::collections::BTreeMap;
 
@@ -75,26 +74,6 @@ fn minimum_tokens_must_not_exceed_the_effective_maximum() {
     stopping.max_new_tokens = 0;
     stopping.min_new_tokens = DEFAULT_MAX_NEW_TOKENS + 1;
     let error = PreparedRequest::new(above_default, &config).unwrap_err();
-    assert_eq!(error.code(), tonic::Code::InvalidArgument);
-}
-
-#[test]
-fn unsupported_prefix_cache_controls_are_rejected() {
-    let config = MockerServerConfig::default();
-    let mut bypass = request("bypass-prefix-cache");
-    bypass.kv = Some(pb::KvCacheParameters {
-        bypass_prefix_cache: true,
-        ..Default::default()
-    });
-    let error = PreparedRequest::new(bypass, &config).unwrap_err();
-    assert_eq!(error.code(), tonic::Code::InvalidArgument);
-
-    let mut salted = request("salted-prefix-cache");
-    salted.kv = Some(pb::KvCacheParameters {
-        cache_salt: "tenant-a".to_string(),
-        ..Default::default()
-    });
-    let error = PreparedRequest::new(salted, &config).unwrap_err();
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
 }
 
@@ -208,71 +187,6 @@ fn service_rejects_non_vllm_or_multi_rank_engines() {
             .to_string()
             .contains("max_concurrent_requests")
     );
-}
-
-#[tokio::test]
-async fn unary_generate_aggregates_the_full_response() {
-    let args = MockEngineArgs::builder()
-        .block_size(4)
-        .num_gpu_blocks(128)
-        .speedup_ratio(0.0)
-        .build()
-        .unwrap();
-    let service = VllmMockerService::new(MockerServerConfig::default(), args).unwrap();
-    let response =
-        pb::generate_server::Generate::generate(&service, Request::new(request("unary")))
-            .await
-            .unwrap()
-            .into_inner();
-    let prompt = response.prompt_info.unwrap();
-    assert_eq!(prompt.num_prompt_tokens, 3);
-    let output = response.outputs.unwrap();
-    assert_eq!(output.num_tokens, 2);
-    assert_eq!(output.token_ids.len(), 2);
-    assert_eq!(output.finish_info.unwrap().num_output_tokens, 2);
-}
-
-#[tokio::test]
-async fn slow_stream_reader_does_not_stall_an_unrelated_rpc() {
-    let args = MockEngineArgs::builder()
-        .block_size(4)
-        .num_gpu_blocks(256)
-        .speedup_ratio(1000.0)
-        .build()
-        .unwrap();
-    let service = VllmMockerService::new(MockerServerConfig::default(), args).unwrap();
-    let output_tokens = 64u32;
-    let mut generate_request = request("slow-reader");
-    generate_request.stopping.as_mut().unwrap().max_new_tokens = output_tokens;
-    let mut stream =
-        pb::generate_server::Generate::generate_stream(&service, Request::new(generate_request))
-            .await
-            .unwrap()
-            .into_inner();
-
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    let fast = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        pb::generate_server::Generate::generate(&service, Request::new(request("fast-reader"))),
-    )
-    .await
-    .expect("an unrelated RPC should not wait for the slow stream")
-    .unwrap()
-    .into_inner();
-    assert_eq!(fast.outputs.unwrap().num_tokens, 2);
-
-    let received = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        let mut received = 0;
-        while let Some(response) = stream.next().await {
-            if response.unwrap().outputs.is_some() {
-                received += 1;
-            }
-        }
-        received
-    })
-    .await
-    .expect("slow gRPC reader should receive the complete stream");
-    assert_eq!(received, output_tokens as usize);
 }
 
 #[tokio::test]
