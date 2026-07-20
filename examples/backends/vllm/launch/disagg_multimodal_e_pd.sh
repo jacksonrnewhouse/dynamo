@@ -124,8 +124,18 @@ fi
 # GPU0 peak ~13.5 GB at DYN_ENCODE_GPU_MEM=0.05, 0.5, 0.9 (identical within jitter).
 # The static peak is bounded by the model's fp16 weights (~14 GB), independent
 # of GPU size. So sizing for this script: encoder needs ~14 GB free per worker GPU.
+#
+# VLLM_ENCODER=0 forces the transformers AutoModel .get_image_features() path for
+# Qwen-VL too, instead of vLLM's mm_encoder_only load. On vLLM 0.25.x the
+# encoder-only engine init runs a memory profile_run that executes the language
+# model on Meta tensors, and the `_C::rms_norm` custom op has no registered
+# fake/Meta kernel, so the encode worker crashes at startup with
+# NotImplementedError even under --enforce-eager. The transformers path avoids
+# the vLLM engine entirely. Trades the encoder-only memory saving for a working
+# encode worker; override with VLLM_ENCODER=1 once the upstream vLLM gap is fixed.
 echo "Starting encode worker on GPU $DYN_ENCODE_WORKER_GPU (--gpu-memory-utilization $DYN_ENCODE_GPU_MEM)..."
 DYN_SYSTEM_PORT=${DYN_SYSTEM_PORT1:-8081} \
+VLLM_ENCODER=${VLLM_ENCODER:-0} \
 CUDA_VISIBLE_DEVICES=$DYN_ENCODE_WORKER_GPU \
 python -m dynamo.vllm \
   --enable-multimodal \
