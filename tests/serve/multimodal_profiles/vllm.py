@@ -179,7 +179,10 @@ VLLM_MULTIMODAL_PROFILES: list[MultimodalModelProfile] = [
                 tests=[MmCase(payload=make_image_payload(["green"]))],
             ),
             "epd_video": TopologyConfig(
-                marks=[pytest.mark.post_merge],
+                # TEMPORARY: flipped to pre_merge so PR CI exercises the EPD
+                # encode-worker fix (VLLM_ENCODER=0). REVERT to post_merge before
+                # merging — the other EPD variants (epd, e_pd) stay post_merge.
+                marks=[pytest.mark.pre_merge],
                 timeout_s=600,
                 delayed_start=60,
                 single_gpu=True,
